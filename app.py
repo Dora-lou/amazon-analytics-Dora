@@ -10,7 +10,7 @@ from typing import Any
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode, DataReturnMode
 import json
 
 
@@ -18,6 +18,9 @@ APP_TITLE = "店铺数据分析-Dora"
 DATA_DIR = Path("data")
 HISTORY_FILE = DATA_DIR / "history.csv"
 RULES_FILE = DATA_DIR / "rule_templates.json"
+BUDGET_FILE = DATA_DIR / "budget_targets.json"
+PARENT_BUDGET_FILE = DATA_DIR / "budget_targets_parent_asin.json"
+CHILD_BUDGET_FILE = DATA_DIR / "budget_targets_child_asin.json"
 REQUIRED_FIELDS = [
     "date",
     "product_line",
@@ -63,6 +66,90 @@ def is_streamlit_cloud() -> bool:
         or os.getenv("STREAMLIT_SHARING")
         or os.getenv("STREAMLIT_RUNTIME_ENV", "").strip().lower() == "cloud"
     )
+
+
+def rerun_app() -> None:
+    """兼容不同 Streamlit 版本的 rerun API。"""
+    try:
+        rerun = getattr(st, "rerun", None)
+        if callable(rerun):
+            rerun()
+            return
+        exp = getattr(st, "experimental_rerun", None)
+        if callable(exp):
+            exp()
+            return
+    except Exception:
+        return
+
+
+def _budget_record(value: Any) -> dict[str, Any]:
+    """
+    兼容旧格式：
+    - 旧：{"某产品线": 123.0}
+    - 新：{"某产品线": {"target": 123.0, "checked": true}}
+    """
+
+    if isinstance(value, dict):
+        target = float(value.get("target", 0.0) or 0.0)
+        checked = bool(value.get("checked", False))
+        return {"target": target, "checked": checked}
+    try:
+        return {"target": float(value or 0.0), "checked": False}
+    except Exception:
+        return {"target": 0.0, "checked": False}
+
+
+def load_budget_targets() -> dict[str, dict[str, Any]]:
+    if is_streamlit_cloud():
+        data = st.session_state.get("_budget_targets", {})
+        raw = data if isinstance(data, dict) else {}
+        return {str(k): _budget_record(v) for k, v in raw.items()}
+    if not BUDGET_FILE.exists():
+        return {}
+    try:
+        with open(BUDGET_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return {str(k): _budget_record(v) for k, v in raw.items()}
+        return {}
+    except Exception:
+        return {}
+
+
+def save_budget_targets(targets: dict[str, dict[str, Any]]) -> None:
+    if is_streamlit_cloud():
+        st.session_state["_budget_targets"] = targets
+        return
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(BUDGET_FILE, "w", encoding="utf-8") as f:
+        json.dump(targets, f, ensure_ascii=False, indent=2)
+
+
+def load_budget_store(file_path: Path, session_key: str) -> dict[str, dict[str, Any]]:
+    if is_streamlit_cloud():
+        data = st.session_state.get(session_key, {})
+        raw = data if isinstance(data, dict) else {}
+        return {str(k): _budget_record(v) for k, v in raw.items()}
+    if not file_path.exists():
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return {str(k): _budget_record(v) for k, v in raw.items()}
+        return {}
+    except Exception:
+        return {}
+
+
+def save_budget_store(file_path: Path, session_key: str, targets: dict[str, dict[str, Any]]) -> None:
+    if is_streamlit_cloud():
+        st.session_state[session_key] = targets
+        return
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(targets, f, ensure_ascii=False, indent=2)
 
 
 FIELD_CANDIDATES: dict[str, list[str]] = {
@@ -1629,7 +1716,38 @@ def main() -> None:
                     ["product_line"],
                     metrics_line,
                 )
-                overall_cols = selectable_columns(line_overall, "line_overall", ["product_line"])
+
+                # 日预算目标（只在下面大表里编辑）
+                budget_targets = load_budget_targets()
+                st.caption("提示：你可以在下方大表里直接编辑“日预算目标/已调整”。云端部署时该值默认仅本次会话有效。")
+                b1, b2, _b3 = st.columns([1, 1, 6])
+                with b1:
+                    mark_all = st.button("一键全勾选", key="budget_mark_all")
+                with b2:
+                    clear_all = st.button("一键清除勾选", key="budget_clear_all")
+
+                if mark_all or clear_all:
+                    # 先更新保存，再重跑刷新表格
+                    for pl in line_overall["product_line"].astype(str).tolist():
+                        record = budget_targets.get(pl, {"target": 0.0, "checked": False})
+                        record = _budget_record(record)
+                        record["checked"] = True if mark_all else False
+                        budget_targets[pl] = record
+                    save_budget_targets(budget_targets)
+                    rerun_app()
+
+                # 合并到产品线总表：日预算目标 + 日均花费（当前周期）+ 差值（实际-目标）
+                module_days = max((module_end - module_start).days + 1, 1)
+                line_overall["日预算目标"] = (
+                    line_overall["product_line"].astype(str).map(lambda k: budget_targets.get(str(k), {}).get("target", 0.0)).fillna(0.0)
+                )
+                line_overall["已调整"] = (
+                    line_overall["product_line"].astype(str).map(lambda k: bool(budget_targets.get(str(k), {}).get("checked", False))).fillna(False)
+                )
+                line_overall["日均花费"] = safe_divide(line_overall["spend"], pd.Series(module_days, index=line_overall.index))
+                line_overall["差值"] = line_overall["日均花费"] - line_overall["日预算目标"]
+
+                overall_cols = selectable_columns(line_overall, "line_overall", ["product_line", "日预算目标", "已调整", "日均花费", "差值"])
                 sorted_overall = line_overall.sort_values("sales", ascending=False)
                 st.markdown(f"<div style='margin-bottom:10px;font-weight:700;color:#0f172a'>{summarize_product_lines(line_overall)}</div>", unsafe_allow_html=True)
 
@@ -1637,7 +1755,10 @@ def main() -> None:
                 mode_map = {"关闭": "off", "环比": "rb", "同比": "yoy"}
                 ratio_mode_line = mode_map[mode_label_line]
 
-                grid_cols_line = list(dict.fromkeys(overall_cols + metrics_line))
+                # 列顺序：产品线、日预算目标、日均花费、其余指标
+                grid_cols_line = [c for c in overall_cols if c in sorted_overall.columns] + [
+                    m for m in metrics_line if m in sorted_overall.columns and m not in overall_cols
+                ]
                 display_overall = sorted_overall[grid_cols_line].copy()
 
                 def _fmt_val(metric: str, value: Any) -> str:
@@ -1683,16 +1804,76 @@ def main() -> None:
                             texts.append(f"{v_text} ({d_text})")
                     display_overall[metric] = texts
 
+                # 日均花费显示为金额（不做环比/同比文本拼接）
+                if "日均花费" in display_overall.columns:
+                    display_overall["日均花费"] = display_overall["日均花费"].apply(lambda v: f"{float(v):,.2f}" if pd.notna(v) else "")
+
+                # 差值：实际（日均花费）-目标（日预算目标），带方向箭头
+                if "差值" in display_overall.columns:
+                    def _fmt_diff(v: Any) -> str:
+                        try:
+                            num = float(v)
+                        except Exception:
+                            return ""
+                        if num == 0:
+                            return "0.00"
+                        arrow = "↑" if num > 0 else "↓"
+                        return f"{num:,.2f} {arrow}"
+
+                    display_overall["差值"] = display_overall["差值"].apply(_fmt_diff)
+
                 gb_overall = GridOptionsBuilder.from_dataframe(display_overall)
-                gb_overall.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False)
+                gb_overall.configure_default_column(
+                    resizable=True,
+                    filter=True,
+                    sortable=True,
+                    wrapText=False,
+                    autoHeight=False,
+                    editable=False,
+                )
+                if "日预算目标" in display_overall.columns:
+                    gb_overall.configure_column("日预算目标", editable=True, type=["numericColumn"])
+                if "已调整" in display_overall.columns:
+                    gb_overall.configure_column(
+                        "已调整",
+                        editable=True,
+                        width=110,
+                        cellRenderer="agCheckboxCellRenderer",
+                        cellEditor="agCheckboxCellEditor",
+                    )
                 grid_options_overall = gb_overall.build()
-                AgGrid(
+                grid_resp = AgGrid(
                     display_overall,
                     gridOptions=grid_options_overall,
                     fit_columns_on_grid_load=True,
                     enable_enterprise_modules=False,
                     theme="balham",
+                    update_mode=GridUpdateMode.VALUE_CHANGED,
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
                 )
+
+                # 把用户在表格里修改的“日预算目标/已调整”保存下来
+                try:
+                    updated = grid_resp.get("data")
+                except Exception:
+                    updated = None
+                if updated is not None:
+                    if isinstance(updated, pd.DataFrame):
+                        updated_df = updated
+                    else:
+                        updated_df = pd.DataFrame(updated)
+                    if not updated_df.empty and "product_line" in updated_df.columns:
+                        new_targets: dict[str, dict[str, Any]] = dict(budget_targets)
+                        for _, row in updated_df.iterrows():
+                            pl = str(row.get("product_line", "")).strip()
+                            if not pl:
+                                continue
+                            target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in updated_df.columns else 0.0
+                            checked = bool(row.get("已调整", False)) if "已调整" in updated_df.columns else False
+                            new_targets[pl] = {"target": target, "checked": checked}
+                        if new_targets != budget_targets:
+                            save_budget_targets(new_targets)
+                            budget_targets = new_targets
 
             with st.container(border=True):
                 title_col, action_col = st.columns([5, 1])
@@ -1764,6 +1945,7 @@ def main() -> None:
             st.warning("当前模块筛选下产品数据为空。")
             return
         module_start, module_end = module_df["date"].min(), module_df["date"].max()
+        module_days = max((module_end - module_start).days + 1, 1)
         module_lines = module_df["product_line"].dropna().unique()
         module_scope = comparison_scope[comparison_scope["product_line"].isin(module_lines)]
         module_prev = previous_period(module_scope, module_start, module_end)
@@ -1798,6 +1980,38 @@ def main() -> None:
             ["product_line", "parent_asin", "child_asin", "brand"],
             metrics_for_change,
         )
+
+        # 预算/勾选：父 ASIN（按 product_line+parent_asin+brand 保存）
+        parent_store = load_budget_store(PARENT_BUDGET_FILE, "_budget_targets_parent")
+        parent_key = (
+            product_view["product_line"].astype(str)
+            + "||"
+            + product_view["parent_asin"].astype(str)
+            + "||"
+            + product_view["brand"].astype(str)
+        )
+        product_view["_budget_key"] = parent_key
+        product_view["日预算目标"] = product_view["_budget_key"].map(lambda k: float(parent_store.get(str(k), {}).get("target", 0.0))).fillna(0.0)
+        product_view["已调整"] = product_view["_budget_key"].map(lambda k: bool(parent_store.get(str(k), {}).get("checked", False))).fillna(False)
+        product_view["日均花费"] = safe_divide(product_view["spend"], pd.Series(module_days, index=product_view.index))
+        product_view["差值"] = product_view["日均花费"] - product_view["日预算目标"]
+
+        # 预算/勾选：子 ASIN（按 product_line+parent_asin+child_asin+brand 保存）
+        child_store = load_budget_store(CHILD_BUDGET_FILE, "_budget_targets_child")
+        child_key = (
+            child_view["product_line"].astype(str)
+            + "||"
+            + child_view["parent_asin"].astype(str)
+            + "||"
+            + child_view["child_asin"].astype(str)
+            + "||"
+            + child_view["brand"].astype(str)
+        )
+        child_view["_budget_key"] = child_key
+        child_view["日预算目标"] = child_view["_budget_key"].map(lambda k: float(child_store.get(str(k), {}).get("target", 0.0))).fillna(0.0)
+        child_view["已调整"] = child_view["_budget_key"].map(lambda k: bool(child_store.get(str(k), {}).get("checked", False))).fillna(False)
+        child_view["日均花费"] = safe_divide(child_view["spend"], pd.Series(module_days, index=child_view.index))
+        child_view["差值"] = child_view["日均花费"] - child_view["日预算目标"]
         # 自定义规则：用户可定义“表现好/差”规则（最多3条，All 条件 AND）
         with st.expander("自定义表现规则（可选）", expanded=False):
             st.write("你可以动态添加/删除规则，规则间为 AND 关系。支持保存为模板并快速加载。")
@@ -1835,7 +2049,7 @@ def main() -> None:
                 with c4:
                     if st.button("删除", key=f"bad_del_{idx}"):
                         st.session_state["bad_rules"].pop(idx)
-                        st.experimental_rerun()
+                        rerun_app()
                 st.session_state["bad_rules"][idx] = {"metric": metric, "op": op, "value": val}
             if st.button("新增‘表现差’规则"):
                 st.session_state["bad_rules"].append({"metric": "sales", "op": "<", "value": 0.0})
@@ -1852,7 +2066,7 @@ def main() -> None:
                 with c4:
                     if st.button("删除", key=f"good_del_{idx}"):
                         st.session_state["good_rules"].pop(idx)
-                        st.experimental_rerun()
+                        rerun_app()
                 st.session_state["good_rules"][idx] = {"metric": metric, "op": op, "value": val}
             if st.button("新增‘表现好’规则"):
                 st.session_state["good_rules"].append({"metric": "sales", "op": ">", "value": 0.0})
@@ -1875,10 +2089,27 @@ def main() -> None:
                 table_download(format_metric_table(product_view), "产品表现总览.xlsx", "⬇ 下载")
             st.markdown('<div class="section-caption">曝光 → 点击 → Session → 转化，默认只保留核心决策字段。</div>', unsafe_allow_html=True)
             st.markdown(f"<div style='margin-bottom:10px;font-weight:700;color:#0f172a'>{summarize_products(product_view, good_mask, bad_mask)}</div>", unsafe_allow_html=True)
+            p1, p2, _p3 = st.columns([1, 1, 6])
+            with p1:
+                mark_all_parent = st.button("一键全勾选（父ASIN）", key="parent_mark_all")
+            with p2:
+                clear_all_parent = st.button("一键清除勾选（父ASIN）", key="parent_clear_all")
+            if mark_all_parent or clear_all_parent:
+                new_parent_store = dict(parent_store)
+                for k in product_view["_budget_key"].astype(str).tolist():
+                    record = _budget_record(new_parent_store.get(k, {"target": 0.0, "checked": False}))
+                    record["checked"] = True if mark_all_parent else False
+                    new_parent_store[k] = record
+                save_budget_store(PARENT_BUDGET_FILE, "_budget_targets_parent", new_parent_store)
+                rerun_app()
             # 排序与列选择
             sort_by = st.selectbox("排序方式", ["sales", "orders", "acos", "acoas", "cvr"], format_func=lambda x: DISPLAY_NAMES.get(x, x))
             ascending = sort_by in {"acos", "acoas"}
-            selected_cols = selectable_columns(product_view, "product_all", ["标签", "product_line", "parent_asin", "sku", "brand"])
+            selected_cols = selectable_columns(
+                product_view,
+                "product_all",
+                ["标签", "已调整", "product_line", "parent_asin", "sku", "brand", "日预算目标", "日均花费", "差值"],
+            )
             sorted_product = product_view.sort_values(sort_by, ascending=ascending).head(200)
 
             # 选择显示模式：关闭 / 环比 / 同比
@@ -1935,17 +2166,63 @@ def main() -> None:
                         texts.append(f"{v_text}  ({d_text})")
                 display_df[metric] = texts
 
+            # 日均花费：金额显示
+            if "日均花费" in display_df.columns:
+                display_df["日均花费"] = display_df["日均花费"].apply(lambda v: f"{float(v):,.2f}" if pd.notna(v) else "")
+
+            # 差值：带箭头
+            if "差值" in display_df.columns:
+                def _fmt_diff_parent(v: Any) -> str:
+                    try:
+                        num = float(v)
+                    except Exception:
+                        return ""
+                    if num == 0:
+                        return "0.00"
+                    arrow = "↑" if num > 0 else "↓"
+                    return f"{num:,.2f} {arrow}"
+
+                display_df["差值"] = display_df["差值"].apply(_fmt_diff_parent)
+
             gb = GridOptionsBuilder.from_dataframe(display_df)
-            gb.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False)
+            gb.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False, editable=False)
+            if "日预算目标" in display_df.columns:
+                gb.configure_column("日预算目标", editable=True, type=["numericColumn"])
+            if "已调整" in display_df.columns:
+                gb.configure_column(
+                    "已调整",
+                    editable=True,
+                    width=120,
+                    cellRenderer="agCheckboxCellRenderer",
+                    cellEditor="agCheckboxCellEditor",
+                )
             grid_options = gb.build()
 
-            AgGrid(
+            resp_parent = AgGrid(
                 display_df,
                 gridOptions=grid_options,
                 fit_columns_on_grid_load=True,
                 enable_enterprise_modules=False,
                 theme="balham",
+                update_mode=GridUpdateMode.VALUE_CHANGED,
+                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
             )
+            # 保存表内编辑的预算目标/勾选
+            updated = resp_parent.get("data") if isinstance(resp_parent, dict) else None
+            if updated is not None:
+                upd_df = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
+                if not upd_df.empty and "_budget_key" in upd_df.columns:
+                    new_parent_store = dict(parent_store)
+                    for _, row in upd_df.iterrows():
+                        k = str(row.get("_budget_key", "")).strip()
+                        if not k:
+                            continue
+                        target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in upd_df.columns else 0.0
+                        checked = bool(row.get("已调整", False)) if "已调整" in upd_df.columns else False
+                        new_parent_store[k] = {"target": target, "checked": checked}
+                    if new_parent_store != parent_store:
+                        save_budget_store(PARENT_BUDGET_FILE, "_budget_targets_parent", new_parent_store)
+                        rerun_app()
 
         # 子 ASIN 产品表现（支持同/环比）
         with st.container(border=True):
@@ -1958,6 +2235,19 @@ def main() -> None:
                 '<div class="section-caption">细化到子 ASIN / SKU 维度查看曝光、点击、转化情况，可与父 ASIN 表一起对比。</div>',
                 unsafe_allow_html=True,
             )
+            c1, c2, _c3 = st.columns([1, 1, 6])
+            with c1:
+                mark_all_child = st.button("一键全勾选（子ASIN）", key="child_mark_all")
+            with c2:
+                clear_all_child = st.button("一键清除勾选（子ASIN）", key="child_clear_all")
+            if mark_all_child or clear_all_child:
+                new_child_store = dict(child_store)
+                for k in child_view["_budget_key"].astype(str).tolist():
+                    record = _budget_record(new_child_store.get(k, {"target": 0.0, "checked": False}))
+                    record["checked"] = True if mark_all_child else False
+                    new_child_store[k] = record
+                save_budget_store(CHILD_BUDGET_FILE, "_budget_targets_child", new_child_store)
+                rerun_app()
 
             # 排序与列选择
             sort_by_child = st.selectbox(
@@ -1970,7 +2260,7 @@ def main() -> None:
             selected_cols_child = selectable_columns(
                 child_view,
                 "product_child",
-                ["product_line", "parent_asin", "child_asin", "brand"],
+                ["已调整", "product_line", "parent_asin", "child_asin", "brand", "日预算目标", "日均花费", "差值"],
             )
             sorted_child = child_view.sort_values(sort_by_child, ascending=ascending_child).head(300)
 
@@ -2031,19 +2321,64 @@ def main() -> None:
                         texts.append(f"{v_text}  ({d_text})")
                 display_child[metric] = texts
 
+            # 日均花费：金额显示
+            if "日均花费" in display_child.columns:
+                display_child["日均花费"] = display_child["日均花费"].apply(lambda v: f"{float(v):,.2f}" if pd.notna(v) else "")
+
+            # 差值：带箭头
+            if "差值" in display_child.columns:
+                def _fmt_diff_child(v: Any) -> str:
+                    try:
+                        num = float(v)
+                    except Exception:
+                        return ""
+                    if num == 0:
+                        return "0.00"
+                    arrow = "↑" if num > 0 else "↓"
+                    return f"{num:,.2f} {arrow}"
+
+                display_child["差值"] = display_child["差值"].apply(_fmt_diff_child)
+
             gb_child = GridOptionsBuilder.from_dataframe(display_child)
             gb_child.configure_default_column(
-                resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False
+                resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False, editable=False
             )
+            if "日预算目标" in display_child.columns:
+                gb_child.configure_column("日预算目标", editable=True, type=["numericColumn"])
+            if "已调整" in display_child.columns:
+                gb_child.configure_column(
+                    "已调整",
+                    editable=True,
+                    width=120,
+                    cellRenderer="agCheckboxCellRenderer",
+                    cellEditor="agCheckboxCellEditor",
+                )
             grid_options_child = gb_child.build()
 
-            AgGrid(
+            resp_child = AgGrid(
                 display_child,
                 gridOptions=grid_options_child,
                 fit_columns_on_grid_load=True,
                 enable_enterprise_modules=False,
                 theme="balham",
+                update_mode=GridUpdateMode.VALUE_CHANGED,
+                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
             )
+            updated = resp_child.get("data") if isinstance(resp_child, dict) else None
+            if updated is not None:
+                upd_df = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
+                if not upd_df.empty and "_budget_key" in upd_df.columns:
+                    new_child_store = dict(child_store)
+                    for _, row in upd_df.iterrows():
+                        k = str(row.get("_budget_key", "")).strip()
+                        if not k:
+                            continue
+                        target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in upd_df.columns else 0.0
+                        checked = bool(row.get("已调整", False)) if "已调整" in upd_df.columns else False
+                        new_child_store[k] = {"target": target, "checked": checked}
+                    if new_child_store != child_store:
+                        save_budget_store(CHILD_BUDGET_FILE, "_budget_targets_child", new_child_store)
+                        rerun_app()
 
         good_col, bad_col = st.columns(2)
         with good_col:
