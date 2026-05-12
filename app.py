@@ -95,6 +95,34 @@ def use_aggrid() -> bool:
         return True
     return not is_streamlit_cloud()
 
+
+def shorten_sku(value: Any, max_chars: int = 36) -> str:
+    """
+    SKU 列通常非常长（多个子 ASIN 拼接），云端展示时缩略，避免表格变得不可读。
+    """
+    text = "" if value is None else str(value)
+    text = text.strip()
+    if not text:
+        return ""
+    if "、" in text:
+        parts = [p for p in text.split("、") if p]
+        if len(parts) > 2:
+            return f"{parts[0]}、{parts[1]}…(+{len(parts)-2})"
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
+
+def fmt_percent_value(value: Any, digits: int = 2) -> str:
+    """把 0-1 的比例值格式化成百分比字符串。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    return f"{v * 100:.{digits}f}%"
+
 def _budget_record(value: Any) -> dict[str, Any]:
     """
     兼容旧格式：
@@ -1277,6 +1305,18 @@ def main() -> None:
           color: #334155 !important;
           font-weight: 800 !important;
         }
+        /* 云端表格：不悬停/不展开也能看到完整表头与内容（自动换行） */
+        div[data-testid="stDataFrame"] [role="columnheader"],
+        div[data-testid="stDataFrame"] [role="gridcell"] {
+          white-space: normal !important;
+          overflow: visible !important;
+          text-overflow: clip !important;
+          line-height: 1.25 !important;
+          word-break: break-word !important;
+        }
+        div[data-testid="stDataFrame"] [role="row"] {
+          height: auto !important;
+        }
         div[data-testid="stDataFrame"] [role="row"]:hover {
           background: #f1f5f9 !important;
         }
@@ -2253,16 +2293,20 @@ def main() -> None:
                     updated_df_parent = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
             else:
                 col_config: dict[str, Any] = {}
+                df_for_editor = display_df.copy()
+                if "sku" in df_for_editor.columns:
+                    df_for_editor["sku"] = df_for_editor["sku"].apply(shorten_sku)
                 for col in display_df.columns:
                     if col == "日预算目标":
-                        col_config[col] = st.column_config.NumberColumn(col, min_value=0.0, step=1.0, format="%.2f")
+                        col_config[col] = st.column_config.NumberColumn(col, min_value=0.0, step=1.0, format="%.2f", width="small")
                     elif col == "已调整":
-                        col_config[col] = st.column_config.CheckboxColumn(col)
+                        col_config[col] = st.column_config.CheckboxColumn(col, width="small")
                     else:
-                        # 只有 sku 允许展开查看，其余列不需要点开即可看全；原生表格会在悬停时显示完整内容
-                        col_config[col] = st.column_config.TextColumn(col, disabled=True)
+                        # 除 sku 外都尽量加宽，让内容直接显示
+                        width = "small" if col == "sku" else ("medium" if col in {"brand"} else "large")
+                        col_config[col] = st.column_config.TextColumn(col, disabled=True, width=width)
                 updated_df_parent = st.data_editor(
-                    display_df,
+                    df_for_editor,
                     use_container_width=True,
                     hide_index=True,
                     column_config=col_config,
@@ -2447,15 +2491,19 @@ def main() -> None:
                     updated_df_child = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
             else:
                 col_config: dict[str, Any] = {}
+                df_for_editor = display_child.copy()
+                if "sku" in df_for_editor.columns:
+                    df_for_editor["sku"] = df_for_editor["sku"].apply(shorten_sku)
                 for col in display_child.columns:
                     if col == "日预算目标":
-                        col_config[col] = st.column_config.NumberColumn(col, min_value=0.0, step=1.0, format="%.2f")
+                        col_config[col] = st.column_config.NumberColumn(col, min_value=0.0, step=1.0, format="%.2f", width="small")
                     elif col == "已调整":
-                        col_config[col] = st.column_config.CheckboxColumn(col)
+                        col_config[col] = st.column_config.CheckboxColumn(col, width="small")
                     else:
-                        col_config[col] = st.column_config.TextColumn(col, disabled=True)
+                        width = "small" if col == "sku" else ("medium" if col in {"brand"} else "large")
+                        col_config[col] = st.column_config.TextColumn(col, disabled=True, width=width)
                 updated_df_child = st.data_editor(
-                    display_child,
+                    df_for_editor,
                     use_container_width=True,
                     hide_index=True,
                     column_config=col_config,
@@ -2657,6 +2705,11 @@ def main() -> None:
                             texts.append(f"{v_text} ({d_text})")
                     display_line_ad[metric] = texts
 
+                # 统一百分比字段显示（CTR/CVR/ACOS/ACOAS）
+                for pct_col in ["ctr", "cvr", "acos", "acoas"]:
+                    if pct_col in display_line_ad.columns:
+                        display_line_ad[pct_col] = display_line_ad[pct_col].apply(fmt_percent_value)
+
                 gb_line_ad = GridOptionsBuilder.from_dataframe(display_line_ad)
                 gb_line_ad.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False)
                 grid_options_line_ad = gb_line_ad.build()
@@ -2764,6 +2817,11 @@ def main() -> None:
                     else:
                         texts.append(f"{v_text} ({d_text})")
                 display_ad[metric] = texts
+
+            # 统一百分比字段显示（CTR/CVR/ACOS/ACOAS）
+            for pct_col in ["ctr", "cvr", "acos", "acoas"]:
+                if pct_col in display_ad.columns:
+                    display_ad[pct_col] = display_ad[pct_col].apply(fmt_percent_value)
 
             gb_ad = GridOptionsBuilder.from_dataframe(display_ad)
             gb_ad.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False)
