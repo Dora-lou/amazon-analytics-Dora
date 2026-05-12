@@ -83,6 +83,18 @@ def rerun_app() -> None:
         return
 
 
+def use_aggrid() -> bool:
+    """
+    Streamlit Cloud 上 st_aggrid 组件偶发加载失败（前端资源拉取/代理/延迟等），
+    会导致多个表格直接无法显示。因此云端默认禁用 AgGrid，改用 Streamlit 原生表格。
+    可通过环境变量强制开启：
+    - DORA_FORCE_AGGRID=1
+    """
+
+    if os.getenv("DORA_FORCE_AGGRID", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    return not is_streamlit_cloud()
+
 def _budget_record(value: Any) -> dict[str, Any]:
     """
     兼容旧格式：
@@ -1842,38 +1854,52 @@ def main() -> None:
                         cellEditor="agCheckboxCellEditor",
                     )
                 grid_options_overall = gb_overall.build()
-                grid_resp = AgGrid(
-                    display_overall,
-                    gridOptions=grid_options_overall,
-                    fit_columns_on_grid_load=True,
-                    enable_enterprise_modules=False,
-                    theme="balham",
-                    update_mode=GridUpdateMode.VALUE_CHANGED,
-                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                )
+                # 云端默认不用 AgGrid（避免组件资源加载失败）
+                updated_df: pd.DataFrame | None = None
+                if use_aggrid():
+                    grid_resp = AgGrid(
+                        display_overall,
+                        gridOptions=grid_options_overall,
+                        fit_columns_on_grid_load=True,
+                        enable_enterprise_modules=False,
+                        theme="balham",
+                        update_mode=GridUpdateMode.VALUE_CHANGED,
+                        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                    )
+                    updated = grid_resp.get("data") if isinstance(grid_resp, dict) else None
+                    if updated is not None:
+                        updated_df = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
+                else:
+                    # 原生表格：仅允许编辑两列
+                    col_config: dict[str, Any] = {}
+                    for col in display_overall.columns:
+                        if col == "日预算目标":
+                            col_config[col] = st.column_config.NumberColumn(col, min_value=0.0, step=1.0, format="%.2f")
+                        elif col == "已调整":
+                            col_config[col] = st.column_config.CheckboxColumn(col)
+                        else:
+                            col_config[col] = st.column_config.TextColumn(col, disabled=True)
+                    updated_df = st.data_editor(
+                        display_overall,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=col_config,
+                        key="line_overall_native_editor",
+                    )
 
                 # 把用户在表格里修改的“日预算目标/已调整”保存下来
-                try:
-                    updated = grid_resp.get("data")
-                except Exception:
-                    updated = None
-                if updated is not None:
-                    if isinstance(updated, pd.DataFrame):
-                        updated_df = updated
-                    else:
-                        updated_df = pd.DataFrame(updated)
-                    if not updated_df.empty and "product_line" in updated_df.columns:
-                        new_targets: dict[str, dict[str, Any]] = dict(budget_targets)
-                        for _, row in updated_df.iterrows():
-                            pl = str(row.get("product_line", "")).strip()
-                            if not pl:
-                                continue
-                            target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in updated_df.columns else 0.0
-                            checked = bool(row.get("已调整", False)) if "已调整" in updated_df.columns else False
-                            new_targets[pl] = {"target": target, "checked": checked}
-                        if new_targets != budget_targets:
-                            save_budget_targets(new_targets)
-                            budget_targets = new_targets
+                if updated_df is not None and not updated_df.empty and "product_line" in updated_df.columns:
+                    new_targets: dict[str, dict[str, Any]] = dict(budget_targets)
+                    for _, row in updated_df.iterrows():
+                        pl = str(row.get("product_line", "")).strip()
+                        if not pl:
+                            continue
+                        target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in updated_df.columns else 0.0
+                        checked = bool(row.get("已调整", False)) if "已调整" in updated_df.columns else False
+                        new_targets[pl] = {"target": target, "checked": checked}
+                    if new_targets != budget_targets:
+                        save_budget_targets(new_targets)
+                        budget_targets = new_targets
 
             with st.container(border=True):
                 title_col, action_col = st.columns([5, 1])
@@ -1923,13 +1949,16 @@ def main() -> None:
                 gb_line = GridOptionsBuilder.from_dataframe(display_line)
                 gb_line.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False)
                 grid_options_line = gb_line.build()
-                AgGrid(
-                    display_line,
-                    gridOptions=grid_options_line,
-                    fit_columns_on_grid_load=True,
-                    enable_enterprise_modules=False,
-                    theme="balham",
-                )
+                if use_aggrid():
+                    AgGrid(
+                        display_line,
+                        gridOptions=grid_options_line,
+                        fit_columns_on_grid_load=True,
+                        enable_enterprise_modules=False,
+                        theme="balham",
+                    )
+                else:
+                    st.dataframe(display_line, use_container_width=True, hide_index=True)
                 chart_metric = st.selectbox("趋势指标", ["sales", "spend", "orders", "acos", "acoas", "cvr", "ctr"], format_func=lambda x: DISPLAY_NAMES.get(x, x))
                 daily_line = aggregate_metrics(module_df, ["date", "product_line"])
                 chart_col1, chart_col2 = st.columns([2, 1])
@@ -2184,41 +2213,76 @@ def main() -> None:
 
                 display_df["差值"] = display_df["差值"].apply(_fmt_diff_parent)
 
-            gb = GridOptionsBuilder.from_dataframe(display_df)
-            gb.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False, editable=False)
-            if "日预算目标" in display_df.columns:
-                gb.configure_column("日预算目标", editable=True, type=["numericColumn"])
-            if "已调整" in display_df.columns:
-                gb.configure_column(
-                    "已调整",
-                    editable=True,
-                    width=120,
-                    cellRenderer="agCheckboxCellRenderer",
-                    cellEditor="agCheckboxCellEditor",
-                )
-            grid_options = gb.build()
+            updated_df_parent: pd.DataFrame | None = None
+            if use_aggrid():
+                gb = GridOptionsBuilder.from_dataframe(display_df)
+                gb.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False, editable=False)
+                gb.configure_grid_options(enableBrowserTooltips=True)
+                if "日预算目标" in display_df.columns:
+                    gb.configure_column("日预算目标", editable=True, type=["numericColumn"])
+                if "已调整" in display_df.columns:
+                    gb.configure_column(
+                        "已调整",
+                        editable=True,
+                        width=120,
+                        cellRenderer="agCheckboxCellRenderer",
+                        cellEditor="agCheckboxCellEditor",
+                    )
+                # 除 sku 外，鼠标悬停显示完整内容（不用点开）
+                for col in list(display_df.columns):
+                    if col == "sku":
+                        continue
+                    gb.configure_column(col, tooltipField=col)
+                # 关键列默认加宽，减少省略号
+                for col, w in {"product_line": 140, "parent_asin": 140, "brand": 130}.items():
+                    if col in display_df.columns:
+                        gb.configure_column(col, minWidth=w)
+                grid_options = gb.build()
 
-            resp_parent = AgGrid(
-                display_df,
-                gridOptions=grid_options,
-                fit_columns_on_grid_load=True,
-                enable_enterprise_modules=False,
-                theme="balham",
-                update_mode=GridUpdateMode.VALUE_CHANGED,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            )
-            # 保存表内编辑的预算目标/勾选
-            updated = resp_parent.get("data") if isinstance(resp_parent, dict) else None
-            if updated is not None:
-                upd_df = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
-                if not upd_df.empty and "_budget_key" in upd_df.columns:
-                    new_parent_store = dict(parent_store)
-                    for _, row in upd_df.iterrows():
-                        k = str(row.get("_budget_key", "")).strip()
-                        if not k:
+                resp_parent = AgGrid(
+                    display_df,
+                    gridOptions=grid_options,
+                    fit_columns_on_grid_load=True,
+                    enable_enterprise_modules=False,
+                    theme="balham",
+                    update_mode=GridUpdateMode.VALUE_CHANGED,
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                )
+                updated = resp_parent.get("data") if isinstance(resp_parent, dict) else None
+                if updated is not None:
+                    updated_df_parent = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
+            else:
+                col_config: dict[str, Any] = {}
+                for col in display_df.columns:
+                    if col == "日预算目标":
+                        col_config[col] = st.column_config.NumberColumn(col, min_value=0.0, step=1.0, format="%.2f")
+                    elif col == "已调整":
+                        col_config[col] = st.column_config.CheckboxColumn(col)
+                    else:
+                        # 只有 sku 允许展开查看，其余列不需要点开即可看全；原生表格会在悬停时显示完整内容
+                        col_config[col] = st.column_config.TextColumn(col, disabled=True)
+                updated_df_parent = st.data_editor(
+                    display_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=col_config,
+                    key="parent_product_native_editor",
+                )
+
+            # 保存表内编辑的预算目标/勾选（按可见列重新计算 key，避免依赖隐藏列）
+            if updated_df_parent is not None and not updated_df_parent.empty:
+                new_parent_store = dict(parent_store)
+                needed = {"product_line", "parent_asin", "brand"}
+                if needed.issubset(set(updated_df_parent.columns)):
+                    for _, row in updated_df_parent.iterrows():
+                        pl = str(row.get("product_line", "")).strip()
+                        pa = str(row.get("parent_asin", "")).strip()
+                        br = str(row.get("brand", "")).strip()
+                        if not (pl and pa and br):
                             continue
-                        target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in upd_df.columns else 0.0
-                        checked = bool(row.get("已调整", False)) if "已调整" in upd_df.columns else False
+                        k = f"{pl}||{pa}||{br}"
+                        target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in updated_df_parent.columns else 0.0
+                        checked = bool(row.get("已调整", False)) if "已调整" in updated_df_parent.columns else False
                         new_parent_store[k] = {"target": target, "checked": checked}
                     if new_parent_store != parent_store:
                         save_budget_store(PARENT_BUDGET_FILE, "_budget_targets_parent", new_parent_store)
@@ -2339,42 +2403,80 @@ def main() -> None:
 
                 display_child["差值"] = display_child["差值"].apply(_fmt_diff_child)
 
-            gb_child = GridOptionsBuilder.from_dataframe(display_child)
-            gb_child.configure_default_column(
-                resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False, editable=False
-            )
-            if "日预算目标" in display_child.columns:
-                gb_child.configure_column("日预算目标", editable=True, type=["numericColumn"])
-            if "已调整" in display_child.columns:
-                gb_child.configure_column(
-                    "已调整",
-                    editable=True,
-                    width=120,
-                    cellRenderer="agCheckboxCellRenderer",
-                    cellEditor="agCheckboxCellEditor",
+            grid_options_child = None
+            if use_aggrid():
+                gb_child = GridOptionsBuilder.from_dataframe(display_child)
+                gb_child.configure_default_column(
+                    resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False, editable=False
                 )
-            grid_options_child = gb_child.build()
+                gb_child.configure_grid_options(enableBrowserTooltips=True)
+                if "日预算目标" in display_child.columns:
+                    gb_child.configure_column("日预算目标", editable=True, type=["numericColumn"])
+                if "已调整" in display_child.columns:
+                    gb_child.configure_column(
+                        "已调整",
+                        editable=True,
+                        width=120,
+                        cellRenderer="agCheckboxCellRenderer",
+                        cellEditor="agCheckboxCellEditor",
+                    )
+                # 除 sku 外，鼠标悬停显示完整内容（不用点开）
+                for col in list(display_child.columns):
+                    if col == "sku":
+                        continue
+                    gb_child.configure_column(col, tooltipField=col)
+                # 关键列默认加宽，减少省略号
+                for col, w in {"product_line": 140, "parent_asin": 140, "child_asin": 160, "brand": 130}.items():
+                    if col in display_child.columns:
+                        gb_child.configure_column(col, minWidth=w)
+                grid_options_child = gb_child.build()
 
-            resp_child = AgGrid(
-                display_child,
-                gridOptions=grid_options_child,
-                fit_columns_on_grid_load=True,
-                enable_enterprise_modules=False,
-                theme="balham",
-                update_mode=GridUpdateMode.VALUE_CHANGED,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            )
-            updated = resp_child.get("data") if isinstance(resp_child, dict) else None
-            if updated is not None:
-                upd_df = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
-                if not upd_df.empty and "_budget_key" in upd_df.columns:
-                    new_child_store = dict(child_store)
-                    for _, row in upd_df.iterrows():
-                        k = str(row.get("_budget_key", "")).strip()
-                        if not k:
+            updated_df_child: pd.DataFrame | None = None
+            if use_aggrid():
+                resp_child = AgGrid(
+                    display_child,
+                    gridOptions=grid_options_child,
+                    fit_columns_on_grid_load=True,
+                    enable_enterprise_modules=False,
+                    theme="balham",
+                    update_mode=GridUpdateMode.VALUE_CHANGED,
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                )
+                updated = resp_child.get("data") if isinstance(resp_child, dict) else None
+                if updated is not None:
+                    updated_df_child = updated if isinstance(updated, pd.DataFrame) else pd.DataFrame(updated)
+            else:
+                col_config: dict[str, Any] = {}
+                for col in display_child.columns:
+                    if col == "日预算目标":
+                        col_config[col] = st.column_config.NumberColumn(col, min_value=0.0, step=1.0, format="%.2f")
+                    elif col == "已调整":
+                        col_config[col] = st.column_config.CheckboxColumn(col)
+                    else:
+                        col_config[col] = st.column_config.TextColumn(col, disabled=True)
+                updated_df_child = st.data_editor(
+                    display_child,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=col_config,
+                    key="child_product_native_editor",
+                )
+
+            # 保存表内编辑的预算目标/勾选（按可见列重新计算 key）
+            if updated_df_child is not None and not updated_df_child.empty:
+                new_child_store = dict(child_store)
+                needed = {"product_line", "parent_asin", "child_asin", "brand"}
+                if needed.issubset(set(updated_df_child.columns)):
+                    for _, row in updated_df_child.iterrows():
+                        pl = str(row.get("product_line", "")).strip()
+                        pa = str(row.get("parent_asin", "")).strip()
+                        ca = str(row.get("child_asin", "")).strip()
+                        br = str(row.get("brand", "")).strip()
+                        if not (pl and pa and ca and br):
                             continue
-                        target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in upd_df.columns else 0.0
-                        checked = bool(row.get("已调整", False)) if "已调整" in upd_df.columns else False
+                        k = f"{pl}||{pa}||{ca}||{br}"
+                        target = float(row.get("日预算目标", 0.0) or 0.0) if "日预算目标" in updated_df_child.columns else 0.0
+                        checked = bool(row.get("已调整", False)) if "已调整" in updated_df_child.columns else False
                         new_child_store[k] = {"target": target, "checked": checked}
                     if new_child_store != child_store:
                         save_budget_store(CHILD_BUDGET_FILE, "_budget_targets_child", new_child_store)
@@ -2558,13 +2660,16 @@ def main() -> None:
                 gb_line_ad = GridOptionsBuilder.from_dataframe(display_line_ad)
                 gb_line_ad.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False)
                 grid_options_line_ad = gb_line_ad.build()
-                AgGrid(
-                    display_line_ad,
-                    gridOptions=grid_options_line_ad,
-                    fit_columns_on_grid_load=True,
-                    enable_enterprise_modules=False,
-                    theme="balham",
-                )
+                if use_aggrid():
+                    AgGrid(
+                        display_line_ad,
+                        gridOptions=grid_options_line_ad,
+                        fit_columns_on_grid_load=True,
+                        enable_enterprise_modules=False,
+                        theme="balham",
+                    )
+                else:
+                    st.dataframe(display_line_ad, use_container_width=True, hide_index=True)
 
                 # 父ASIN × 广告类型结构
                 ad_view = ad_wide_summary(module_df, ["product_line", "parent_asin"])
@@ -2663,13 +2768,16 @@ def main() -> None:
             gb_ad = GridOptionsBuilder.from_dataframe(display_ad)
             gb_ad.configure_default_column(resizable=True, filter=True, sortable=True, wrapText=False, autoHeight=False)
             grid_options_ad = gb_ad.build()
-            AgGrid(
-                display_ad,
-                gridOptions=grid_options_ad,
-                fit_columns_on_grid_load=True,
-                enable_enterprise_modules=False,
-                theme="balham",
-            )
+            if use_aggrid():
+                AgGrid(
+                    display_ad,
+                    gridOptions=grid_options_ad,
+                    fit_columns_on_grid_load=True,
+                    enable_enterprise_modules=False,
+                    theme="balham",
+                )
+            else:
+                st.dataframe(display_ad, use_container_width=True, hide_index=True)
             chart1, chart2 = st.columns(2)
             with chart1:
                 st.plotly_chart(px.pie(ad_view, names="ad_type", values="spend", title="花费占比"), use_container_width=True)
