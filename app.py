@@ -123,6 +123,18 @@ def fmt_percent_value(value: Any, digits: int = 2) -> str:
         return str(value)
     return f"{v * 100:.{digits}f}%"
 
+
+def format_compact_number(metric: str, value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "-"
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    if metric == "orders":
+        return f"{v:,.0f}"
+    return f"{v:,.2f}"
+
 def _budget_record(value: Any) -> dict[str, Any]:
     """
     兼容旧格式：
@@ -1754,6 +1766,80 @@ def main() -> None:
                 module_prev_year = None
 
             metrics_line = ["sales", "spend", "orders", "ctr", "cvr", "acos", "acoas", "cpc"]
+
+            # 畅销榜（可按不同维度切换 Top 榜）
+            with st.container(border=True):
+                st.markdown(
+                    '<div class="section-header"><div><div class="module-badge">榜单</div><div class="section-title">畅销榜</div></div></div>',
+                    unsafe_allow_html=True,
+                )
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    rank_metric_label = st.selectbox("指标", ["销量", "销售额", "花费"], index=0, key="rank_metric")
+                with c2:
+                    rank_time = st.selectbox("时间", ["本周期", "今日"], index=0, key="rank_time")
+
+                metric_map = {"销量": "orders", "销售额": "sales", "花费": "spend"}
+                rank_metric = metric_map[rank_metric_label]
+                if rank_time == "今日":
+                    rank_df = module_df[module_df["date"] == module_df["date"].max()].copy()
+                else:
+                    rank_df = module_df.copy()
+
+                rank_tab = st.radio("维度", ["子体", "父体", "分类", "店铺"], horizontal=True, key="rank_dim")
+                if rank_tab == "子体":
+                    group_cols = ["child_asin"]
+                    name_col = "child_asin"
+                elif rank_tab == "父体":
+                    group_cols = ["parent_asin"]
+                    name_col = "parent_asin"
+                elif rank_tab == "分类":
+                    group_cols = ["product_line"]
+                    name_col = "product_line"
+                else:
+                    group_cols = ["brand"]
+                    name_col = "brand"
+
+                top_table = aggregate_metrics(rank_df, group_cols)
+                top_table = top_table.sort_values(rank_metric, ascending=False).head(20)
+
+                # 简洁榜单 UI：左侧排名徽章 + 名称 + 右侧数值
+                st.markdown(
+                    """
+                    <style>
+                      .rank-row{display:flex;align-items:center;justify-content:space-between;padding:10px 10px;border-bottom:1px solid #eef2f7;}
+                      .rank-left{display:flex;align-items:center;gap:12px;min-width:0;}
+                      .rank-badge{width:28px;height:28px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-weight:900;color:#0f172a;background:#f1f5f9;border:1px solid #e5e7eb;}
+                      .rank-name{font-size:16px;font-weight:900;color:#0f172a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:760px;}
+                      .rank-val{font-size:18px;font-weight:900;color:#0f172a;}
+                      .rank-muted{color:#64748b;font-size:12px;margin-top:6px;}
+                    </style>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<div class='rank-muted'>按 {rank_metric_label} 排序 · {rank_time} · Top 20</div>",
+                    unsafe_allow_html=True,
+                )
+                if top_table.empty or name_col not in top_table.columns:
+                    st.info("当前筛选范围内没有可用于生成畅销榜的数据。")
+                else:
+                    for i, row in enumerate(top_table.itertuples(index=False), start=1):
+                        row_dict = row._asdict() if hasattr(row, "_asdict") else {}
+                        name = str(row_dict.get(name_col, "-"))
+                        value = row_dict.get(rank_metric, 0)
+                        st.markdown(
+                            f"""
+                            <div class="rank-row">
+                              <div class="rank-left">
+                                <div class="rank-badge">{i}</div>
+                                <div class="rank-name" title="{name}">{name}</div>
+                              </div>
+                              <div class="rank-val">{format_compact_number(rank_metric, value)}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
 
             # 新增：产品线整体汇总表现（不拆父ASIN）
             with st.container(border=True):
